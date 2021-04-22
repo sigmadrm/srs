@@ -939,6 +939,11 @@ public:
      * that is, to read max bytes of the bytes from the callback, or timeout or error.
      */
     virtual int                 get_vhost_hls_nb_notify(std::string vhost);
+
+    /**
+     * get sigma drm configuration
+     */
+    virtual std::string         get_hls_sigma_drm(std::string vhost);
 // hds section
 private:
     /**

@@ -32,6 +32,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <algorithm>
 #include <sstream>
+#include <openssl/aes.h>
 using namespace std;
 
 #include <srs_kernel_error.hpp>
@@ -50,6 +51,9 @@ using namespace std;
 #include <srs_kernel_ts.hpp>
 #include <srs_app_utility.hpp>
 #include <srs_app_http_hooks.hpp>
+#include <srs_app_http_client.hpp>
+#include <srs_protocol_json.hpp>
+#include <srs_app_http_conn.hpp>
 
 // drop the segment when duration of ts too small.
 #define SRS_AUTO_HLS_SEGMENT_MIN_DURATION_MS 100
@@ -61,6 +65,9 @@ using namespace std;
 // reset the piece id when deviation overflow this.
 #define SRS_JUMP_WHEN_PIECE_DEVIATION 20
 
+#define SRS_HLS_SIGMA_DRM_TIMEOUT_US (int64_t)(60 * 1000 * 1000LL)
+#define SRS_HLS_SIGMA_DRM_KEY_SIZE 16
+
 /**
  * * the HLS section, only available when HLS enabled.
  * */
@@ -70,14 +77,23 @@ SrsHlsCacheWriter::SrsHlsCacheWriter(bool write_cache, bool write_file)
 {
     should_write_cache = write_cache;
     should_write_file = write_file;
+    enc_method = "none";
+    enc_cache_size = 0;
+    aes_key = NULL;
+    total_byte_write = total_byte_encrypt = 0;
 }
 
 SrsHlsCacheWriter::~SrsHlsCacheWriter()
 {
+    if (this->aes_key)
+    {
+        free(this->aes_key);
+    }
 }
 
 int SrsHlsCacheWriter::open(string file)
 {
+    filePath = file;
     if (!should_write_file) {
         return ERROR_SUCCESS;
     }
@@ -87,6 +103,13 @@ int SrsHlsCacheWriter::open(string file)
 
 void SrsHlsCacheWriter::close()
 {
+    if (enc_method == "sigma" && total_byte_write > 0)
+    {
+        uint8_t padValue = SRS_HLS_SIGMA_DRM_KEY_SIZE - enc_cache_size;
+        memset(enc_cache_buffer + enc_cache_size, padValue, SRS_HLS_SIGMA_DRM_KEY_SIZE - enc_cache_size);
+        write(enc_cache_buffer + enc_cache_size, padValue, NULL);
+    }
+
     if (!should_write_file) {
         return;
     }
@@ -114,17 +137,79 @@ int64_t SrsHlsCacheWriter::tellg()
 
 int SrsHlsCacheWriter::write(void* buf, size_t count, ssize_t* pnwrite)
 {
+    total_byte_write += count;
+    // Encrypt buffer
+    size_t transformSize = count;
+    uint8_t *transformBuffer = transformData(buf, count, transformSize);
+    // void *transformBuffer = buf;
     if (should_write_cache) {
         if (count > 0) {
-            data.append((char*)buf, count);
+            data.append((char *)transformBuffer, transformSize);
         }
     }
 
-    if (should_write_file) {
-        return impl.write(buf, count, pnwrite);
+    if (should_write_file)
+    {
+        int ret = impl.write(transformBuffer, transformSize, pnwrite);
+        if (transformBuffer != NULL)
+        {
+            free((uint8_t *)transformBuffer);
+        }
+        return ret;
+    }
+    if (transformBuffer != NULL)
+    {
+        free((uint8_t *)transformBuffer);
     }
 
     return ERROR_SUCCESS;
+}
+uint8_t *SrsHlsCacheWriter::transformData(void *buf, size_t count, size_t &outSize)
+{
+    uint8_t *newData = NULL;
+    if (enc_method == "sigma")
+    {
+        uint64_t totalBuffer = count + enc_cache_size;
+        uint64_t encBufferSize = (totalBuffer / SRS_HLS_SIGMA_DRM_KEY_SIZE) * SRS_HLS_SIGMA_DRM_KEY_SIZE;
+        newData = (uint8_t *)malloc(encBufferSize);
+        memcpy(newData, enc_cache_buffer, enc_cache_size);
+        memcpy(newData + enc_cache_size, buf, encBufferSize - enc_cache_size);
+
+        AES_KEY *key = (AES_KEY *)this->aes_key;
+        AES_cbc_encrypt((unsigned char *)newData, (unsigned char *)newData, encBufferSize, key, this->enc_key_iv, AES_ENCRYPT);
+        memcpy(enc_key_iv, newData + encBufferSize - SRS_HLS_SIGMA_DRM_KEY_SIZE, SRS_HLS_SIGMA_DRM_KEY_SIZE);
+
+        // Cache to next session
+        enc_cache_size = totalBuffer - encBufferSize;
+        memcpy(enc_cache_buffer, (uint8_t *)buf + count - enc_cache_size, enc_cache_size);
+        outSize = encBufferSize;
+        total_byte_encrypt += encBufferSize;
+    }
+    else
+    {
+        newData = (uint8_t *)malloc(count);
+        memcpy(newData, (uint8_t *)buf, count);
+        outSize = count;
+    }
+    return newData;
+}
+void SrsHlsCacheWriter::setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData)
+{
+    if (!this->aes_key)
+    {
+        this->aes_key = (uint8_t *)malloc(sizeof(AES_KEY));
+    }
+    AES_KEY *key = (AES_KEY *)this->aes_key;
+    memcpy(enc_key, keyData, SRS_HLS_SIGMA_DRM_KEY_SIZE);
+    memcpy(enc_key_iv, keyIvData, SRS_HLS_SIGMA_DRM_KEY_SIZE);
+    if (AES_set_encrypt_key(enc_key, 16 * 8, (AES_KEY *)this->aes_key))
+    {
+        srs_error("SrsHlsCacheWriter: set aes key failed. not use drm");
+    }
+    else
+    {
+        enc_method = "sigma";
+    }
 }
 
 string SrsHlsCacheWriter::cache()
@@ -167,6 +252,10 @@ void SrsHlsSegment::update_duration(int64_t current_frame_dts)
     srs_assert(duration >= 0);
     
     return;
+}
+void SrsHlsSegment::setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData)
+{
+    writer->setEncCipher(method, keyData, keyIvData);
 }
 
 SrsDvrAsyncCallOnHls::SrsDvrAsyncCallOnHls(int c, SrsRequest* r, string p, string t, string m, string mu, int s, double d)
@@ -302,6 +391,8 @@ SrsHlsMuxer::SrsHlsMuxer()
     should_write_file = true;
     async = new SrsAsyncCallWorker();
     context = new SrsTsContext();
+    hls_sigma_key = NULL;
+    hls_sigma_uri = "";
 }
 
 SrsHlsMuxer::~SrsHlsMuxer()
@@ -350,7 +441,7 @@ void SrsHlsMuxer::dispose()
     srs_trace("gracefully dispose hls %s", req? req->get_stream_url().c_str() : "");
 }
 
-int SrsHlsMuxer::sequence_no()
+uint64_t SrsHlsMuxer::sequence_no()
 {
     return _sequence_no;
 }
@@ -373,6 +464,11 @@ int SrsHlsMuxer::deviation()
     }
     
     return deviation_ts;
+}
+void SrsHlsMuxer::set_sigma_drm(const std::string &uri, uint8_t *keyData)
+{
+    hls_sigma_uri = uri;
+    hls_sigma_key = keyData;
 }
 
 int SrsHlsMuxer::initialize()
@@ -479,7 +575,10 @@ int SrsHlsMuxer::segment_open(int64_t segment_start_dts)
     current = new SrsHlsSegment(context, should_write_cache, should_write_file, default_acodec, default_vcodec);
     current->sequence_no = _sequence_no++;
     current->segment_start_dts = segment_start_dts;
-    
+    if (hls_sigma_key != NULL && hls_sigma_uri != "")
+    {
+        initEncSegment(current, current->sequence_no);
+    }
     // generate filename.
     std::string ts_file = hls_ts_file;
     ts_file = srs_path_build_stream(ts_file, req->vhost, req->app, req->stream);
@@ -570,6 +669,15 @@ int SrsHlsMuxer::segment_open(int64_t segment_start_dts)
     }
     
     return ret;
+}
+void SrsHlsMuxer::initEncSegment(SrsHlsSegment *segment, uint64_t seq_no)
+{
+    uint8_t keyIv[SRS_HLS_SIGMA_DRM_KEY_SIZE] = {0};
+    for (int idx = 0; idx < SRS_HLS_SIGMA_DRM_KEY_SIZE; idx++)
+    {
+        keyIv[SRS_HLS_SIGMA_DRM_KEY_SIZE - idx - 1] = (seq_no >> (idx * 8)) & 0xFF;
+    }
+    segment->setEncCipher("sigma", hls_sigma_key, keyIv);
 }
 
 int SrsHlsMuxer::on_sequence_header()
@@ -865,6 +973,11 @@ int SrsHlsMuxer::_refresh_m3u8(string m3u8_file)
     ss << "#EXTM3U" << SRS_CONSTS_LF
         << "#EXT-X-VERSION:3" << SRS_CONSTS_LF
         << "#EXT-X-ALLOW-CACHE:YES" << SRS_CONSTS_LF;
+
+    if (hls_sigma_key != NULL && hls_sigma_uri != "")
+    {
+        ss << "#EXT-X-KEY:METHOD=AES-128,URI=\"" << hls_sigma_uri << "\"" << SRS_CONSTS_LF;
+    }
     srs_verbose("write m3u8 header success.");
     
     // #EXT-X-MEDIA-SEQUENCE:4294967295\n
@@ -1218,6 +1331,13 @@ int SrsHls::initialize(SrsSource* s, SrsRequest* r)
         return ret;
     }
 
+    // SaoNV: add request SigmaDRM
+    hls_sigma_drm = _srs_config->get_hls_sigma_drm(r->vhost);
+    if (hls_sigma_drm.length() > 0)
+    {
+        get_sigma_drm(hls_sigma_drm + "?asset=" + r->app + "_" + r->stream);
+    }
+
     return ret;
 }
 
@@ -1261,6 +1381,85 @@ int SrsHls::on_publish(SrsRequest* req, bool fetch_sequence_header)
     }
 
     return ret;
+}
+
+int SrsHls::get_sigma_drm(string sigmaIngestUrl)
+{
+    SrsHttpUri uri;
+    int ret;
+    if ((ret = uri.initialize(sigmaIngestUrl)) != ERROR_SUCCESS)
+    {
+        srs_error("http: post failed. url=%s, ret=%d", sigmaIngestUrl.c_str(), ret);
+        return ret;
+    }
+
+    SrsHttpClient http;
+    if ((ret = http.initialize(uri.get_host(), uri.get_port(), SRS_HLS_SIGMA_DRM_TIMEOUT_US)) != ERROR_SUCCESS)
+    {
+        return ret;
+    }
+    ISrsHttpMessage *msg = NULL;
+    if ((ret = http.get(uri.get_url(), "", &msg)) != ERROR_SUCCESS)
+    {
+        srs_error("HTTP GET %s failed. ret=%d", uri.get_url(), ret);
+        return ret;
+    }
+
+    srs_assert(msg);
+    SrsAutoFree(ISrsHttpMessage, msg);
+
+    std::string body;
+    if ((ret = msg->body_read_all(body)) != ERROR_SUCCESS)
+    {
+        srs_error("content key error. ret=%d", ret);
+        return ret;
+    }
+
+    if (body.empty())
+    {
+        srs_warn("Cannot ingest key");
+        return ret;
+    }
+
+    // parse string body to json.
+    SrsJsonAny *info = SrsJsonAny::loads((char *)body.c_str());
+    if (!info)
+    {
+        ret = ERROR_HTTP_DATA_INVALID;
+        srs_error("invalid ingest key response %s. ret=%d", body.c_str(), ret);
+        return ret;
+    }
+    SrsAutoFree(SrsJsonAny, info);
+
+    // response error code in string.
+    if (!info->is_array())
+    {
+        ret = ERROR_HTTP_DATA_INVALID;
+        srs_error("invalid key ingest response format: %s", body.c_str());
+        return ret;
+    }
+
+    SrsJsonArray *keys = info->to_array();
+    if (keys->count() == 0)
+    {
+        ret = ERROR_HTTP_DATA_INVALID;
+        srs_error("No key found: %s", body.c_str());
+        return ret;
+    }
+    SrsJsonAny *keyAny = keys->at(0);
+    if (!keyAny || !keyAny->is_object())
+    {
+        ret = ERROR_HTTP_DATA_INVALID;
+        srs_error("Key format invalid: %s", body.c_str());
+        return ret;
+    }
+
+    SrsJsonObject *key = keyAny->to_object();
+    hls_sigma_uri = key->ensure_property_string("uri")->to_str();
+    string keyStr = key->ensure_property_string("key")->to_str();
+
+    srs_av_base64_decode((u_int8_t *)hls_sigma_key, keyStr.c_str(), SRS_HLS_SIGMA_DRM_KEY_SIZE);
+    muxer->set_sigma_drm(hls_sigma_uri, hls_sigma_key);
 }
 
 void SrsHls::on_unpublish()
@@ -1440,5 +1639,4 @@ void SrsHls::hls_show_mux_log()
 }
 
 #endif
-
 

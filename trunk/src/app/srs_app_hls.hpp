@@ -68,6 +68,16 @@ private:
     std::string data;
     bool should_write_cache;
     bool should_write_file;
+    uint8_t enc_key[16];
+    uint8_t enc_key_iv[16];
+    uint8_t *aes_key;
+    uint8_t enc_cache_buffer[16];
+    uint8_t enc_cache_size;
+    uint64_t total_byte_write;
+    uint64_t total_byte_encrypt;
+    std::string enc_method;
+    std::string filePath;
+
 public:
     SrsHlsCacheWriter(bool write_cache, bool write_file);
     virtual ~SrsHlsCacheWriter();
@@ -77,6 +87,7 @@ public:
     */
     virtual int open(std::string file);
     virtual void close();
+    virtual void setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData);
 public:
     virtual bool is_open();
     virtual int64_t tellg();
@@ -91,6 +102,8 @@ public:
     * get the string cache.
     */
     virtual std::string cache();
+
+    virtual uint8_t* transformData(void* buf, size_t count, size_t &outSize);
 };
 
 /**
@@ -105,7 +118,7 @@ public:
     // duration in seconds in m3u8.
     double duration;
     // sequence number in m3u8.
-    int sequence_no;
+    uint64_t sequence_no;
     // ts uri in m3u8.
     std::string uri;
     // ts full file to write.
@@ -126,6 +139,7 @@ public:
     * @current_frame_dts the dts of frame, in tbn of ts.
     */
     virtual void update_duration(int64_t current_frame_dts);
+    virtual void setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData);
 };
 
 /**
@@ -201,7 +215,7 @@ private:
     int64_t accept_floor_ts;
     int64_t previous_floor_ts;
 private:
-    int _sequence_no;
+    uint64_t _sequence_no;
     int max_td;
     std::string m3u8;
     std::string m3u8_url;
@@ -229,16 +243,20 @@ private:
      * @see https://github.com/ossrs/srs/issues/375
      */
     SrsTsContext* context;
+
+    std::string hls_sigma_uri;
+    uint8_t *hls_sigma_key;
 public:
     SrsHlsMuxer();
     virtual ~SrsHlsMuxer();
 public:
     virtual void dispose();
 public:
-    virtual int sequence_no();
+    virtual uint64_t sequence_no();
     virtual std::string ts_url();
     virtual double duration();
     virtual int deviation();
+    virtual void set_sigma_drm(const std::string &uri, uint8_t *keyData);
 public:
     /**
     * initialize the hls muxer.
@@ -289,6 +307,7 @@ public:
 private:
     virtual int refresh_m3u8();
     virtual int _refresh_m3u8(std::string m3u8_file);
+    virtual void initEncSegment(SrsHlsSegment *segment, uint64_t seq_no);
 };
 
 /**
@@ -381,6 +400,10 @@ private:
     * not zero dts.
     */
     int64_t stream_dts;
+
+    std::string hls_sigma_drm;
+    std::string hls_sigma_uri;
+    uint8_t hls_sigma_key[16];
 public:
     SrsHls();
     virtual ~SrsHls();
@@ -420,6 +443,7 @@ public:
     virtual int on_video(SrsSharedPtrMessage* shared_video, bool is_sps_pps);
 private:
     virtual void hls_show_mux_log();
+    virtual int get_sigma_drm(std::string sigmaIngestUrl);
 };
 
 #endif
