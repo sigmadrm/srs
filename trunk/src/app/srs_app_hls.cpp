@@ -973,12 +973,6 @@ int SrsHlsMuxer::_refresh_m3u8(string m3u8_file)
     ss << "#EXTM3U" << SRS_CONSTS_LF
         << "#EXT-X-VERSION:3" << SRS_CONSTS_LF
         << "#EXT-X-ALLOW-CACHE:YES" << SRS_CONSTS_LF;
-
-    if (hls_sigma_key != NULL && hls_sigma_uri != "")
-    {
-        ss << "#EXT-X-KEY:METHOD=AES-128,URI=\"" << hls_sigma_uri << "\"" << SRS_CONSTS_LF;
-    }
-    srs_verbose("write m3u8 header success.");
     
     // #EXT-X-MEDIA-SEQUENCE:4294967295\n
     SrsHlsSegment* first = *segments.begin();
@@ -1007,6 +1001,12 @@ int SrsHlsMuxer::_refresh_m3u8(string m3u8_file)
     
     ss << "#EXT-X-TARGETDURATION:" << target_duration << SRS_CONSTS_LF;
     srs_verbose("write m3u8 duration success.");
+
+    if (hls_sigma_key != NULL && hls_sigma_uri != "")
+    {
+        ss << "#EXT-X-KEY:METHOD=AES-128,URI=\"" << hls_sigma_uri << "\"" << SRS_CONSTS_LF;
+    }
+    srs_verbose("write m3u8 header success.");
     
     // write all segments
     for (it = segments.begin(); it != segments.end(); ++it) {
