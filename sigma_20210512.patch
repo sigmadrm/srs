@@ -1,0 +1,559 @@
+diff --git a/trunk/conf/srs.conf b/trunk/conf/srs.conf
+index da062849a..2678a1ab6 100644
+--- a/trunk/conf/srs.conf
++++ b/trunk/conf/srs.conf
+@@ -5,6 +5,7 @@ listen              1935;
+ max_connections     1000;
+ srs_log_tank        file;
+ srs_log_file        ./objs/srs.log;
++srs_log_level       info;
+ http_api {
+     enabled         on;
+     listen          1985;
+@@ -19,4 +20,14 @@ stats {
+     disk            sda sdb xvda xvdb;
+ }
+ vhost __defaultVhost__ {
++    hls {
++        enabled         on;
++        hls_path        /mnt/d/SVN_THUDO/SCTV_OTT/DRM/v2.0/packager/www/srs;
++        hls_wait_keyframe on;
++        hls_fragment    10;
++        hls_window      60;
++        hls_m3u8_file   [app]/[stream].m3u8;
++        hls_ts_file     [app]/[stream]-[seq].ts;
++        hls_sigma_drm   http://api-staging.sigmadrm.com/proxy/srs/d4a43d63-4583-467e-86c3-5567793045f3/5019c1ff-d55f-4e4e-aaa2-206af1ce0506;
++    }
+ }
+diff --git a/trunk/src/app/srs_app_config.cpp b/trunk/src/app/srs_app_config.cpp
+index 9ee6c668c..258422757 100644
+--- a/trunk/src/app/srs_app_config.cpp
++++ b/trunk/src/app/srs_app_config.cpp
+@@ -87,6 +87,7 @@ const char* _srs_version = "XCORE-"RTMP_SIG_SRS_SERVER;
+ #define SRS_CONF_DEFAULT_HLS_CLEANUP true
+ #define SRS_CONF_DEFAULT_HLS_WAIT_KEYFRAME true
+ #define SRS_CONF_DEFAULT_HLS_NB_NOTIFY 64
++#define SRS_CONF_DEFAULT_HLS_SIGMA_DRM ""
+ #define SRS_CONF_DEFAULT_DVR_PATH "./objs/nginx/html/[app]/[stream].[timestamp].flv"
+ #define SRS_CONF_DEFAULT_DVR_PLAN_SESSION "session"
+ #define SRS_CONF_DEFAULT_DVR_PLAN_SEGMENT "segment"
+@@ -1898,7 +1899,7 @@ int SrsConfig::check_config()
+                     if (m != "enabled" && m != "hls_entry_prefix" && m != "hls_path" && m != "hls_fragment" && m != "hls_window" && m != "hls_on_error"
+                         && m != "hls_storage" && m != "hls_mount" && m != "hls_td_ratio" && m != "hls_aof_ratio" && m != "hls_acodec" && m != "hls_vcodec"
+                         && m != "hls_m3u8_file" && m != "hls_ts_file" && m != "hls_ts_floor" && m != "hls_cleanup" && m != "hls_nb_notify"
+-                        && m != "hls_wait_keyframe" && m != "hls_dispose"
++                        && m != "hls_wait_keyframe" && m != "hls_dispose" && m != "hls_sigma_drm"
+                         ) {
+                         ret = ERROR_SYSTEM_CONFIG_INVALID;
+                         srs_error("unsupported vhost hls directive %s, ret=%d", m.c_str(), ret);
+@@ -3898,6 +3899,25 @@ bool SrsConfig::get_hls_wait_keyframe(string vhost)
+     return SRS_CONF_PERFER_TRUE(conf->arg0());
+ }
+ 
++string SrsConfig::get_hls_sigma_drm(string vhost)
++{
++    SrsConfDirective *hls = get_hls(vhost);
++
++    if (!hls)
++    {
++        return SRS_CONF_DEFAULT_HLS_SIGMA_DRM;
++    }
++
++    SrsConfDirective *conf = hls->get("hls_sigma_drm");
++
++    if (!conf)
++    {
++        return SRS_CONF_DEFAULT_HLS_SIGMA_DRM;
++    }
++
++    return conf->arg0();
++}
++
+ SrsConfDirective *SrsConfig::get_hds(const string &vhost)
+ {
+     SrsConfDirective* conf = get_vhost(vhost);
+@@ -4629,4 +4649,4 @@ bool srs_stream_caster_is_rtsp(string caster)
+ bool srs_stream_caster_is_flv(string caster)
+ {
+     return caster == SRS_CONF_DEFAULT_STREAM_CASTER_FLV;
+-}
++}
+\ No newline at end of file
+diff --git a/trunk/src/app/srs_app_config.hpp b/trunk/src/app/srs_app_config.hpp
+index 89f3922d6..8dc107d66 100644
+--- a/trunk/src/app/srs_app_config.hpp
++++ b/trunk/src/app/srs_app_config.hpp
+@@ -939,6 +939,11 @@ public:
+      * that is, to read max bytes of the bytes from the callback, or timeout or error.
+      */
+     virtual int                 get_vhost_hls_nb_notify(std::string vhost);
++
++    /**
++     * get sigma drm configuration
++     */
++    virtual std::string         get_hls_sigma_drm(std::string vhost);
+ // hds section
+ private:
+     /**
+diff --git a/trunk/src/app/srs_app_hls.cpp b/trunk/src/app/srs_app_hls.cpp
+index 384cb7a9e..783c6365c 100644
+--- a/trunk/src/app/srs_app_hls.cpp
++++ b/trunk/src/app/srs_app_hls.cpp
+@@ -32,6 +32,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ 
+ #include <algorithm>
+ #include <sstream>
++#include <openssl/aes.h>
+ using namespace std;
+ 
+ #include <srs_kernel_error.hpp>
+@@ -50,6 +51,9 @@ using namespace std;
+ #include <srs_kernel_ts.hpp>
+ #include <srs_app_utility.hpp>
+ #include <srs_app_http_hooks.hpp>
++#include <srs_app_http_client.hpp>
++#include <srs_protocol_json.hpp>
++#include <srs_app_http_conn.hpp>
+ 
+ // drop the segment when duration of ts too small.
+ #define SRS_AUTO_HLS_SEGMENT_MIN_DURATION_MS 100
+@@ -61,6 +65,9 @@ using namespace std;
+ // reset the piece id when deviation overflow this.
+ #define SRS_JUMP_WHEN_PIECE_DEVIATION 20
+ 
++#define SRS_HLS_SIGMA_DRM_TIMEOUT_US (int64_t)(60 * 1000 * 1000LL)
++#define SRS_HLS_SIGMA_DRM_KEY_SIZE 16
++
+ /**
+  * * the HLS section, only available when HLS enabled.
+  * */
+@@ -70,14 +77,23 @@ SrsHlsCacheWriter::SrsHlsCacheWriter(bool write_cache, bool write_file)
+ {
+     should_write_cache = write_cache;
+     should_write_file = write_file;
++    enc_method = "none";
++    enc_cache_size = 0;
++    aes_key = NULL;
++    total_byte_write = total_byte_encrypt = 0;
+ }
+ 
+ SrsHlsCacheWriter::~SrsHlsCacheWriter()
+ {
++    if (this->aes_key)
++    {
++        free(this->aes_key);
++    }
+ }
+ 
+ int SrsHlsCacheWriter::open(string file)
+ {
++    filePath = file;
+     if (!should_write_file) {
+         return ERROR_SUCCESS;
+     }
+@@ -87,6 +103,13 @@ int SrsHlsCacheWriter::open(string file)
+ 
+ void SrsHlsCacheWriter::close()
+ {
++    if (enc_method == "sigma" && total_byte_write > 0)
++    {
++        uint8_t padValue = SRS_HLS_SIGMA_DRM_KEY_SIZE - enc_cache_size;
++        memset(enc_cache_buffer + enc_cache_size, padValue, SRS_HLS_SIGMA_DRM_KEY_SIZE - enc_cache_size);
++        write(enc_cache_buffer + enc_cache_size, padValue, NULL);
++    }
++
+     if (!should_write_file) {
+         return;
+     }
+@@ -114,18 +137,80 @@ int64_t SrsHlsCacheWriter::tellg()
+ 
+ int SrsHlsCacheWriter::write(void* buf, size_t count, ssize_t* pnwrite)
+ {
++    total_byte_write += count;
++    // Encrypt buffer
++    size_t transformSize = count;
++    uint8_t *transformBuffer = transformData(buf, count, transformSize);
++    // void *transformBuffer = buf;
+     if (should_write_cache) {
+         if (count > 0) {
+-            data.append((char*)buf, count);
++            data.append((char *)transformBuffer, transformSize);
+         }
+     }
+ 
+-    if (should_write_file) {
+-        return impl.write(buf, count, pnwrite);
++    if (should_write_file)
++    {
++        int ret = impl.write(transformBuffer, transformSize, pnwrite);
++        if (transformBuffer != NULL)
++        {
++            free((uint8_t *)transformBuffer);
++        }
++        return ret;
++    }
++    if (transformBuffer != NULL)
++    {
++        free((uint8_t *)transformBuffer);
+     }
+ 
+     return ERROR_SUCCESS;
+ }
++uint8_t *SrsHlsCacheWriter::transformData(void *buf, size_t count, size_t &outSize)
++{
++    uint8_t *newData = NULL;
++    if (enc_method == "sigma")
++    {
++        uint64_t totalBuffer = count + enc_cache_size;
++        uint64_t encBufferSize = (totalBuffer / SRS_HLS_SIGMA_DRM_KEY_SIZE) * SRS_HLS_SIGMA_DRM_KEY_SIZE;
++        newData = (uint8_t *)malloc(encBufferSize);
++        memcpy(newData, enc_cache_buffer, enc_cache_size);
++        memcpy(newData + enc_cache_size, buf, encBufferSize - enc_cache_size);
++
++        AES_KEY *key = (AES_KEY *)this->aes_key;
++        AES_cbc_encrypt((unsigned char *)newData, (unsigned char *)newData, encBufferSize, key, this->enc_key_iv, AES_ENCRYPT);
++        memcpy(enc_key_iv, newData + encBufferSize - SRS_HLS_SIGMA_DRM_KEY_SIZE, SRS_HLS_SIGMA_DRM_KEY_SIZE);
++
++        // Cache to next session
++        enc_cache_size = totalBuffer - encBufferSize;
++        memcpy(enc_cache_buffer, (uint8_t *)buf + count - enc_cache_size, enc_cache_size);
++        outSize = encBufferSize;
++        total_byte_encrypt += encBufferSize;
++    }
++    else
++    {
++        newData = (uint8_t *)malloc(count);
++        memcpy(newData, (uint8_t *)buf, count);
++        outSize = count;
++    }
++    return newData;
++}
++void SrsHlsCacheWriter::setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData)
++{
++    if (!this->aes_key)
++    {
++        this->aes_key = (uint8_t *)malloc(sizeof(AES_KEY));
++    }
++    AES_KEY *key = (AES_KEY *)this->aes_key;
++    memcpy(enc_key, keyData, SRS_HLS_SIGMA_DRM_KEY_SIZE);
++    memcpy(enc_key_iv, keyIvData, SRS_HLS_SIGMA_DRM_KEY_SIZE);
++    if (AES_set_encrypt_key(enc_key, 16 * 8, (AES_KEY *)this->aes_key))
++    {
++        srs_error("SrsHlsCacheWriter: set aes key failed. not use drm");
++    }
++    else
++    {
++        enc_method = "sigma";
++    }
++}
+ 
+ string SrsHlsCacheWriter::cache()
+ {
+@@ -168,6 +253,10 @@ void SrsHlsSegment::update_duration(int64_t current_frame_dts)
+     
+     return;
+ }
++void SrsHlsSegment::setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData)
++{
++    writer->setEncCipher(method, keyData, keyIvData);
++}
+ 
+ SrsDvrAsyncCallOnHls::SrsDvrAsyncCallOnHls(int c, SrsRequest* r, string p, string t, string m, string mu, int s, double d)
+ {
+@@ -302,6 +391,8 @@ SrsHlsMuxer::SrsHlsMuxer()
+     should_write_file = true;
+     async = new SrsAsyncCallWorker();
+     context = new SrsTsContext();
++    hls_sigma_key = NULL;
++    hls_sigma_uri = "";
+ }
+ 
+ SrsHlsMuxer::~SrsHlsMuxer()
+@@ -350,7 +441,7 @@ void SrsHlsMuxer::dispose()
+     srs_trace("gracefully dispose hls %s", req? req->get_stream_url().c_str() : "");
+ }
+ 
+-int SrsHlsMuxer::sequence_no()
++uint64_t SrsHlsMuxer::sequence_no()
+ {
+     return _sequence_no;
+ }
+@@ -374,6 +465,11 @@ int SrsHlsMuxer::deviation()
+     
+     return deviation_ts;
+ }
++void SrsHlsMuxer::set_sigma_drm(const std::string &uri, uint8_t *keyData)
++{
++    hls_sigma_uri = uri;
++    hls_sigma_key = keyData;
++}
+ 
+ int SrsHlsMuxer::initialize()
+ {
+@@ -479,7 +575,10 @@ int SrsHlsMuxer::segment_open(int64_t segment_start_dts)
+     current = new SrsHlsSegment(context, should_write_cache, should_write_file, default_acodec, default_vcodec);
+     current->sequence_no = _sequence_no++;
+     current->segment_start_dts = segment_start_dts;
+-    
++    if (hls_sigma_key != NULL && hls_sigma_uri != "")
++    {
++        initEncSegment(current, current->sequence_no);
++    }
+     // generate filename.
+     std::string ts_file = hls_ts_file;
+     ts_file = srs_path_build_stream(ts_file, req->vhost, req->app, req->stream);
+@@ -571,6 +670,15 @@ int SrsHlsMuxer::segment_open(int64_t segment_start_dts)
+     
+     return ret;
+ }
++void SrsHlsMuxer::initEncSegment(SrsHlsSegment *segment, uint64_t seq_no)
++{
++    uint8_t keyIv[SRS_HLS_SIGMA_DRM_KEY_SIZE] = {0};
++    for (int idx = 0; idx < SRS_HLS_SIGMA_DRM_KEY_SIZE; idx++)
++    {
++        keyIv[SRS_HLS_SIGMA_DRM_KEY_SIZE - idx - 1] = (seq_no >> (idx * 8)) & 0xFF;
++    }
++    segment->setEncCipher("sigma", hls_sigma_key, keyIv);
++}
+ 
+ int SrsHlsMuxer::on_sequence_header()
+ {
+@@ -865,7 +973,6 @@ int SrsHlsMuxer::_refresh_m3u8(string m3u8_file)
+     ss << "#EXTM3U" << SRS_CONSTS_LF
+         << "#EXT-X-VERSION:3" << SRS_CONSTS_LF
+         << "#EXT-X-ALLOW-CACHE:YES" << SRS_CONSTS_LF;
+-    srs_verbose("write m3u8 header success.");
+     
+     // #EXT-X-MEDIA-SEQUENCE:4294967295\n
+     SrsHlsSegment* first = *segments.begin();
+@@ -894,6 +1001,12 @@ int SrsHlsMuxer::_refresh_m3u8(string m3u8_file)
+     
+     ss << "#EXT-X-TARGETDURATION:" << target_duration << SRS_CONSTS_LF;
+     srs_verbose("write m3u8 duration success.");
++
++    if (hls_sigma_key != NULL && hls_sigma_uri != "")
++    {
++        ss << "#EXT-X-KEY:METHOD=AES-128,URI=\"" << hls_sigma_uri << "\"" << SRS_CONSTS_LF;
++    }
++    srs_verbose("write m3u8 header success.");
+     
+     // write all segments
+     for (it = segments.begin(); it != segments.end(); ++it) {
+@@ -1218,6 +1331,13 @@ int SrsHls::initialize(SrsSource* s, SrsRequest* r)
+         return ret;
+     }
+ 
++    // SaoNV: add request SigmaDRM
++    hls_sigma_drm = _srs_config->get_hls_sigma_drm(r->vhost);
++    if (hls_sigma_drm.length() > 0)
++    {
++        get_sigma_drm(hls_sigma_drm + "?asset=" + r->app + "_" + r->stream);
++    }
++
+     return ret;
+ }
+ 
+@@ -1263,6 +1383,85 @@ int SrsHls::on_publish(SrsRequest* req, bool fetch_sequence_header)
+     return ret;
+ }
+ 
++int SrsHls::get_sigma_drm(string sigmaIngestUrl)
++{
++    SrsHttpUri uri;
++    int ret;
++    if ((ret = uri.initialize(sigmaIngestUrl)) != ERROR_SUCCESS)
++    {
++        srs_error("http: post failed. url=%s, ret=%d", sigmaIngestUrl.c_str(), ret);
++        return ret;
++    }
++
++    SrsHttpClient http;
++    if ((ret = http.initialize(uri.get_host(), uri.get_port(), SRS_HLS_SIGMA_DRM_TIMEOUT_US)) != ERROR_SUCCESS)
++    {
++        return ret;
++    }
++    ISrsHttpMessage *msg = NULL;
++    if ((ret = http.get(uri.get_url(), "", &msg)) != ERROR_SUCCESS)
++    {
++        srs_error("HTTP GET %s failed. ret=%d", uri.get_url(), ret);
++        return ret;
++    }
++
++    srs_assert(msg);
++    SrsAutoFree(ISrsHttpMessage, msg);
++
++    std::string body;
++    if ((ret = msg->body_read_all(body)) != ERROR_SUCCESS)
++    {
++        srs_error("content key error. ret=%d", ret);
++        return ret;
++    }
++
++    if (body.empty())
++    {
++        srs_warn("Cannot ingest key");
++        return ret;
++    }
++
++    // parse string body to json.
++    SrsJsonAny *info = SrsJsonAny::loads((char *)body.c_str());
++    if (!info)
++    {
++        ret = ERROR_HTTP_DATA_INVALID;
++        srs_error("invalid ingest key response %s. ret=%d", body.c_str(), ret);
++        return ret;
++    }
++    SrsAutoFree(SrsJsonAny, info);
++
++    // response error code in string.
++    if (!info->is_array())
++    {
++        ret = ERROR_HTTP_DATA_INVALID;
++        srs_error("invalid key ingest response format: %s", body.c_str());
++        return ret;
++    }
++
++    SrsJsonArray *keys = info->to_array();
++    if (keys->count() == 0)
++    {
++        ret = ERROR_HTTP_DATA_INVALID;
++        srs_error("No key found: %s", body.c_str());
++        return ret;
++    }
++    SrsJsonAny *keyAny = keys->at(0);
++    if (!keyAny || !keyAny->is_object())
++    {
++        ret = ERROR_HTTP_DATA_INVALID;
++        srs_error("Key format invalid: %s", body.c_str());
++        return ret;
++    }
++
++    SrsJsonObject *key = keyAny->to_object();
++    hls_sigma_uri = key->ensure_property_string("uri")->to_str();
++    string keyStr = key->ensure_property_string("key")->to_str();
++
++    srs_av_base64_decode((u_int8_t *)hls_sigma_key, keyStr.c_str(), SRS_HLS_SIGMA_DRM_KEY_SIZE);
++    muxer->set_sigma_drm(hls_sigma_uri, hls_sigma_key);
++}
++
+ void SrsHls::on_unpublish()
+ {
+     int ret = ERROR_SUCCESS;
+@@ -1441,4 +1640,3 @@ void SrsHls::hls_show_mux_log()
+ 
+ #endif
+ 
+-
+diff --git a/trunk/src/app/srs_app_hls.hpp b/trunk/src/app/srs_app_hls.hpp
+index 960a295bb..9d3ec30a1 100644
+--- a/trunk/src/app/srs_app_hls.hpp
++++ b/trunk/src/app/srs_app_hls.hpp
+@@ -68,6 +68,16 @@ private:
+     std::string data;
+     bool should_write_cache;
+     bool should_write_file;
++    uint8_t enc_key[16];
++    uint8_t enc_key_iv[16];
++    uint8_t *aes_key;
++    uint8_t enc_cache_buffer[16];
++    uint8_t enc_cache_size;
++    uint64_t total_byte_write;
++    uint64_t total_byte_encrypt;
++    std::string enc_method;
++    std::string filePath;
++
+ public:
+     SrsHlsCacheWriter(bool write_cache, bool write_file);
+     virtual ~SrsHlsCacheWriter();
+@@ -77,6 +87,7 @@ public:
+     */
+     virtual int open(std::string file);
+     virtual void close();
++    virtual void setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData);
+ public:
+     virtual bool is_open();
+     virtual int64_t tellg();
+@@ -91,6 +102,8 @@ public:
+     * get the string cache.
+     */
+     virtual std::string cache();
++
++    virtual uint8_t* transformData(void* buf, size_t count, size_t &outSize);
+ };
+ 
+ /**
+@@ -105,7 +118,7 @@ public:
+     // duration in seconds in m3u8.
+     double duration;
+     // sequence number in m3u8.
+-    int sequence_no;
++    uint64_t sequence_no;
+     // ts uri in m3u8.
+     std::string uri;
+     // ts full file to write.
+@@ -126,6 +139,7 @@ public:
+     * @current_frame_dts the dts of frame, in tbn of ts.
+     */
+     virtual void update_duration(int64_t current_frame_dts);
++    virtual void setEncCipher(const std::string &method, uint8_t *keyData, uint8_t *keyIvData);
+ };
+ 
+ /**
+@@ -201,7 +215,7 @@ private:
+     int64_t accept_floor_ts;
+     int64_t previous_floor_ts;
+ private:
+-    int _sequence_no;
++    uint64_t _sequence_no;
+     int max_td;
+     std::string m3u8;
+     std::string m3u8_url;
+@@ -229,16 +243,20 @@ private:
+      * @see https://github.com/ossrs/srs/issues/375
+      */
+     SrsTsContext* context;
++
++    std::string hls_sigma_uri;
++    uint8_t *hls_sigma_key;
+ public:
+     SrsHlsMuxer();
+     virtual ~SrsHlsMuxer();
+ public:
+     virtual void dispose();
+ public:
+-    virtual int sequence_no();
++    virtual uint64_t sequence_no();
+     virtual std::string ts_url();
+     virtual double duration();
+     virtual int deviation();
++    virtual void set_sigma_drm(const std::string &uri, uint8_t *keyData);
+ public:
+     /**
+     * initialize the hls muxer.
+@@ -289,6 +307,7 @@ public:
+ private:
+     virtual int refresh_m3u8();
+     virtual int _refresh_m3u8(std::string m3u8_file);
++    virtual void initEncSegment(SrsHlsSegment *segment, uint64_t seq_no);
+ };
+ 
+ /**
+@@ -381,6 +400,10 @@ private:
+     * not zero dts.
+     */
+     int64_t stream_dts;
++
++    std::string hls_sigma_drm;
++    std::string hls_sigma_uri;
++    uint8_t hls_sigma_key[16];
+ public:
+     SrsHls();
+     virtual ~SrsHls();
+@@ -420,6 +443,7 @@ public:
+     virtual int on_video(SrsSharedPtrMessage* shared_video, bool is_sps_pps);
+ private:
+     virtual void hls_show_mux_log();
++    virtual int get_sigma_drm(std::string sigmaIngestUrl);
+ };
+ 
+ #endif
