@@ -673,7 +673,8 @@ int SrsHlsMuxer::segment_open(int64_t segment_start_dts)
 void SrsHlsMuxer::initEncSegment(SrsHlsSegment *segment, uint64_t seq_no)
 {
     uint8_t keyIv[SRS_HLS_SIGMA_DRM_KEY_SIZE] = {0};
-    for (int idx = 0; idx < SRS_HLS_SIGMA_DRM_KEY_SIZE; idx++)
+	int sequnceByteSize = 8;
+    for (int idx = 0; idx < sequnceByteSize; idx++)
     {
         keyIv[SRS_HLS_SIGMA_DRM_KEY_SIZE - idx - 1] = (seq_no >> (idx * 8)) & 0xFF;
     }
